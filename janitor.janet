@@ -1,9 +1,14 @@
 (import tempfiles :as temp)
-(import path)
+(import path :as p)
+(import stringx :as str)
+
+(math/seedrandom (os/time))
+
 (defn git-scan? [obj]
   (match obj
     {:path (p (string? p)) :error err} true
-    {:path (p (string? p))
+    {
+     :path (p (string? p))
      # a
      :unpushed-commits (uc (number? uc))
      # b
@@ -21,16 +26,14 @@
   (def path-elems (match (os/which)
                     :windows (string/split ";" (os/getenv "PATH"))
                     _ (string/split ":" (os/getenv "PATH"))))
-
   (prompt :donezo
   (loop [pe :in path-elems
-         :before (def pat (path/join pe exename))
+         :before (def pat (p/join pe exename))
          :when (when-let [f (os/stat pat) 
                           mode (f :mode)
                           ]
                  (= mode :file)) ]
       (return :donezo pat))))
-
 
 # Ordinary changed entries of the following format
 # 1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
@@ -54,11 +57,10 @@
 
   (def lines (map string/trim (string/split "\n" status-output)))
   (def [unpushed-commits behind-commits] 
-    (reduce (fn [[a b] l] 
-              (if-let [[a$ b$] (peg/match ~(* "branch.ab +" (<- :d+) " -" (<- :d+)) l)]
-                [(scan-number a$) (scan-number b$)]
-                [a b])) 
-            [0 0] lines))
+    (prompt :found 
+            (each l lines 
+              (match (peg/match ~(* "# branch.ab +" (<- :d+) " -" (<- :d+)) l)
+                [a$ b$] (return :found [(scan-number a$) (scan-number b$)])))))
 
   (defn any-prefix? [prefixes str] (any? (map |(string/has-prefix? $ str) prefixes)))
   (def changed-files (length (filter |(any-prefix? ["1" "2" "u"] $) lines)))
@@ -66,7 +68,7 @@
 
   {:path path
    :unpushed-commits unpushed-commits
-   :behind-commmits behind-commits
+   :behind-commits behind-commits
    :changed-files changed-files
    :untracked-files untracked-files})
 
@@ -74,37 +76,35 @@
            :windows (find-on-path "jpm.bat")
            _ (find-on-path "jpm")))
 
-(defn make-deps-proc [mod-dir] 
-    (os/spawn [jpm "deps"] :e @{
-                            "JANET_MODPATH" (buffer mod-dir)
-                            "JANET_PATH" (buffer (os/getenv "JANET_PATH"))
-                            "XDX" @"123"
-                            "PATH" (buffer (os/getenv "PATH"))
-                            :out :pipe
-                            :err :pipe
-                            }))
+(defn make-deps-proc [target-dir mod-dir] 
+  (def env (os/environ))
+  (put env "JANET_MODPATH" mod-dir)
+  (put env :out :pipe)
+  (put env :err :pipe)
+  (os/spawn [jpm "deps"] :ep env))
 
 (defn deps-and-test-scan [path] 
-  (def mod-dir (path/join (temp/dir) (temp/random-name 15)))
+  (def mod-dir (p/join (temp/dir) (temp/random-name 15)))
   (os/mkdir mod-dir)
   (os/cd path)
-  (def deps-proc (make-deps-proc mod-dir))
+  (def deps-proc (make-deps-proc path mod-dir))
   (:read (deps-proc :out) :all)
   (def err-buf (:read (deps-proc :err) :all))
   (def deps-ret (:wait deps-proc))
+
   (when (not= 0 deps-ret) 
     (break [[false err-buf] [false @""]]))
-  # From here on, we consider jpm-deps to have paased
+
+  # From here on, we consider jpm-deps to have passed
   (os/cd path)
-  (def test-proc (os/spawn [jpm "test"] :ep
-                           {"JANET_PATH" (os/getenv "JANET_PATH")
-                            "PATH" (os/getenv "PATH")
-                            "JANET_MODPATH" mod-dir
-                            :out :pipe
-                            :err :pipe}))
+  (def env (os/environ))
+  (put env "JANET_MODPATH" mod-dir)
+  (put env :out :pipe)
+  (def test-proc (os/spawn [jpm "test"] :ep env))
   # Drain the buffers
-  (:read (test-proc :out) :all)
-  (def err-buf (:read (test-proc :err) :all))
+  # (:read (test-proc :out) :all)
+  # (def err-buf (:read (test-proc :err) :all))
+  (ev/deadline 60)
   (def test-ret (:wait test-proc))
   (if (not= 0 test-ret)
     [true [false test-ret]]
@@ -116,37 +116,111 @@
     (ev/give chan [:dep-test path (deps-and-test-scan path)])
     (ev/give chan [:done path])))
 
-(defn scan-dirs [] 
+(defn list-dirs [path] 
+  (defn dir-to-scan? [path] 
+    (and 
+      (= (get (os/stat path) :mode) :directory)
+      (as?-> 
+        (os/stat (p/join path "project.janet")) it
+        (= (get it :mode) :file))
+      (not (as?-> 
+        (os/stat (p/join path ".janitor-ignore")) it
+        (do (eprint "Ingnoring " it) it)
+        (= (get it :mode) :file)))))
+  (filter dir-to-scan? (os/dir path)))
+
+(defn scan-dirs [paths] 
   (def ch (ev/chan))
   (def done (ev/chan))
   # Create a set of  
-  (def paths (table ;(flatten (map |[(path/abspath $) true] (os/dir ".")))))
   (ev/spawn 
     (def res @{})
     (while (> (length paths) 0)
       (def chres (ev/take ch))
       (match chres 
-        [:done path] (put paths path nil)
-        [:git path scan] (put-in res [path :git-scan] scan)
+        [:done path] (do 
+                       (eprint "Done with all checks on " (p/basename path))
+                       (put paths path nil)
+                       (if (> (length paths) 3)
+                         (eprint (length paths) " projects remain.")
+                         (eprint (string/join (map p/basename (keys paths)) ", ") " remain")))
+        [:git path scan] (do 
+                           (eprint "Finished git scan of " (p/basename path))
+                           (put-in res [path :git-scan] scan))
         [:dep-test path [deps test]] 
         (do 
+          (eprint "Completed deps and test checks of " (p/basename path))
           (put-in res [path :deps-scan] deps)
           (put-in res [path :test-scan] test))
         other (error other)))
     (ev/give done res))
-  (each p (keys paths) (scan-dir p ch))
+  (comment ```
+           Info to show:
+           git a/b
+           git untracked files
+           git changed files
+           jpm deps (pass/fail)
+           jpm test (pass/fail)
+
+           @task[TODO: Get all of the information output in a table like this]
+
+           | Path || Git: unpushed | behind | untracked | changed || jpm: deps | test |
+
+           ```)
+  (each p (keys paths) 
+    (eprint "Starting scan of " (p/basename p))
+    (try
+    (scan-dir p ch)
+    ([err] (do
+             (eprint "Had to abort " p )
+             (ev/give ch [:done p])))))
   (def res (ev/take done))
-  (eachp [k v] res
-    (prin k ":")
-    (pp v)
-    ))
+
+  (def max-path (max ;(map |(as-> $ it (p/basename it) (length it)) (keys res))))
+
+  (print "")
+  (prin (str/pad-right "|| Path " (+ 4 max-path)))
+  (print "|| Git: changed | unpushed | behind | untracked || jpm: deps | test    |")
+  (eachp [path report] res
+    (prin (str/pad-right (string "|| " (p/basename path) " ")  (+ 4 max-path)))
+
+    (def gitinfo (report :git-scan))
+    (def deps-pass (match (report :deps-scan)
+                     true "clean"
+                     [false] "broken"))
+    (def test-pass (match (report :test-scan)
+                     true "pass"
+                     [false] "failing"))
+    (print 
+      (str/pad-right (string "|| "(gitinfo :changed-files)) (length "|| Git: changed "))
+      (str/pad-right (string "| " (gitinfo :unpushed-commits)) (length "| unpushed "))
+      (str/pad-right (string "| " (gitinfo :behind-commits)) (length "| behind "))
+      (str/pad-right (string "| "(gitinfo :untracked-files)) (length "| untracked "))
+      (str/pad-right (string "|| " deps-pass) (length "|| jpm: deps "))
+      (str/pad-right (string "| "test-pass " |") (length "| passing |")))))
+
+(defn usage [] 
+  (print ```
+         Jantior usage:
+         janitor scan-dirs
+         janitor scan <dir>
+         ```))
 
 (defn main [& clargs]
   (def clargs (array ;clargs))
   (when (> (length clargs) 0) (array/remove clargs 0))
   (def [subcommand] clargs)
-  (def args clargs)
+  (def args (array/slice clargs 1))
 
   (case subcommand 
-    "scan" (scan-dirs)
-    true ()))
+    "scan-dirs" (do 
+                  (def paths (table ;(flatten (map |[(p/abspath $) true] (list-dirs ".")))))
+                  (scan-dirs paths)
+                  (os/exit 0))
+    "scan" (do 
+             (match args 
+               [dir] (scan-dirs @{(p/abspath dir) true})
+               _ (do (print "Bad args to scan " args)(usage))))
+    true (do
+           (print "Unknown subcommand " subcommand)
+           (usage))))
