@@ -4,7 +4,6 @@ Scans your janet projects to check for uncommitted files, unpushed commits, brok
 
 ## Usage
 
-`janitor scan <dir>`
-
-
+`janitor scan <dir>` to scan an individual directory
+`janitor scan-dirs` to scan all of the subdirectories of the current directory, provided they have a project.janet
 

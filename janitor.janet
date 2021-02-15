@@ -100,10 +100,11 @@
   (def env (os/environ))
   (put env "JANET_MODPATH" mod-dir)
   (put env :out :pipe)
+  (put env :err :pipe)
   (def test-proc (os/spawn [jpm "test"] :ep env))
   # Drain the buffers
-  # (:read (test-proc :out) :all)
-  # (def err-buf (:read (test-proc :err) :all))
+  (:read (test-proc :out) :all)
+  (def err-buf (:read (test-proc :err) :all))
   (ev/deadline 60)
   (def test-ret (:wait test-proc))
   (if (not= 0 test-ret)
